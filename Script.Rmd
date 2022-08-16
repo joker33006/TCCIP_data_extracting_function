@@ -1,0 +1,180 @@
+---
+title: "TCCIP之1km網格資料擷取函數"
+output: html_notebook
+---
+
+概述：針對TCCIP一公里網格資料進行資料擷取與整合。本函式會使用到平行演算之概念。
+# Step 0. package 
+```{r}
+library(data.table)#資料讀取與整合
+library(parallel) # 平行演算用
+path <- "E:/climdata/TCCIP/1960_2020_1km_daily/"
+```
+
+# Step 1. 了解資料格式與型態
+在進行分析前，先了解資料的格式、型態與架構，了解資料的pattern(規律)才能建構正確的函數。同時，若要大幅度縮減資料整理分析時間，也必須從資料格式著手進行。
+名稱格式：
+"觀測_日資料_中部_平均溫_1960.csv"
+表格格式：" LON	 LAT	19600101"
+
+在建構函數時，建議先將步驟拆解。各個細部分析可以完成，最後組成函數才能順利進行。因此我們先初步載入資料來檢視資料格式，再思考如何設計函數。
+
+```{r}
+dt <- fread(paste0(path,"/avg_T/觀測_日資料_中部_平均溫_1978.csv"))
+## 修正欄位名稱並移除多餘的欄位
+### 注意!由於年的日數會變動，因此欄位長度記得改用函數抓取而非使用固定數值
+colnames(dt) <- c(colnames(dt)[2:ncol(dt)],"na")
+dt[,na:=NULL]
+```
+# Step 2. 思考函數功能
+製作函數的目的，是為了簡化重複步驟。以TCCIP為例，我們可能要反覆查找不同時間、地點的氣候因子。需要輸入變數可以設計為時間、地點(座標)或是氣象因子(平均溫、最高溫、最低溫等)。
+## 2.1 地點對照表
+檢視過後資料，我們會發現在"地點"上，TCCIP的資料是將台灣全島拆分成4個區域儲存資料。因此，當我們要查找某一地點的氣候因子時，必須先確定該座標位於哪一個分區。可以有很多做法，個人偏好先將4個區域的座標整合成一個對照表，方便後續處理。
+```{r}
+
+loca_c <- lapply(c("東部","南部","北部","中部"),function(x){
+  ###讀入各區域第一年度檔案
+  dt <- fread(paste0(path,"/avg_T/觀測_日資料_",
+                     x,"_平均溫_1960.csv"))
+  ### 修改欄位名稱(如step1)
+  colnames(dt) <- c(colnames(dt)[2:ncol(dt)],"na")
+  dt[,na:=NULL]
+  ###擷取座標並新增分區對照欄位
+  dt <- dt[,1:2]
+  dt[,set:=x]
+})
+### 將list結合成表並存放起來
+loca_c <- rbindlist(loca_c)
+loca_c <- loca_c[,key:=paste0(LON,LAT)][duplicated(key)==FALSE]
+loca_c[,key:=NULL]
+write.csv(loca_c,"location_table.csv")
+```
+## 2.2 地點查找
+接下來就要開始進行地點查詢了。我們可以將座標位置作為輸入參數。但是這樣在進行複數地點查找時反而會增添許多麻煩。因此我個人傾向將點位製成表格作為輸入參數。
+
+另外，在檢視地點表格的過程中可以發現座標數值並非整數。因此必須思考資料查找的策略。
+
+```{r}
+### 輸入地點查找表格
+s_loc <- fread("search_loc.csv")
+### 建立地點表格的對應key
+
+s_loc[,lon_k:=lapply(LON,function(x){
+  loca_c[,LON_loc:=x-LON]
+  loca_c[LON_loc<0,LON_loc:=-LON_loc]
+  lon_key <- which.min(loca_c[,LON_loc])
+  loca_c[,LON_loc:=NULL]  
+  return(loca_c[lon_key,LON])
+  })]
+s_loc[,lat_k:=lapply(LAT,function(x){
+  loca_c[,LAT_loc:=x-LAT]
+  loca_c[LAT_loc<0,LAT_loc:=-LAT_loc]
+  lat_key <- which.min(loca_c[,LAT_loc])
+  loca_c[,LAT_loc:=NULL]
+    return(loca_c[lat_key,LAT])
+  })]
+### 查找各地點對應的分區
+s_loc[,lon_k:=as.numeric(lon_k)][,lat_k:=as.numeric(lat_k)]
+###建立基礎的位置對照表格
+bs_loc <- loca_c[s_loc,on=.(LON=lon_k,LAT=lat_k)]
+setnames(bs_loc,c("i.LON","i.LAT"),c("org_LON","org_LAT"))
+rm(s_loc,loca_c)
+```
+## Step 2.3 氣候資料篩選與組合-單一表格
+當我們鎖定位置之後，下一個步驟就是篩選出所需的氣候因子。由於我們已經把不同氣候因子分別放置在不同資料夾內，因此要篩選不同氣候因子只需要改變讀取路徑即可。重點在於把不同檔案的數據進行處理，然後將數據合併。先嘗試使用單一座標對應單一表格進行，再使用平行演算功能做復表格同步進行。以`bs_loc`作為基礎點位表格。
+```{r}
+
+###擷取單一座標
+loc_point <- bs_loc[1]
+### 假設平均溫是我們想要擷取的資料，首先依據分區篩選目標
+####將可能改變的參數設定為變數，方便後續建立迴圈或函數
+clim_factor <- "avg_T" 
+#### 依據分區篩選出所需檔案名稱
+section <- as.character(loc_point[1,3])
+#### 由於字元編碼問題，如果直接指定pattern為"東部"會讀不到資料，因此先讀入檔案路徑後，再利用grep來篩選出所需檔案路徑。
+clim_file <-list.files(paste0(path,clim_factor),
+                       pattern = ".csv", full.names=TRUE)
+clim_file <- clim_file[grep(section,clim_file)]
+
+#分歧點
+#### 先嘗試處理單一檔案資料
+clim_dt <- fread(clim_file[1])
+##### 參照step 1 修改欄位名稱
+colnames(clim_dt) <- c(colnames(clim_dt)[2:ncol(clim_dt)],"na")
+clim_dt[,na:=NULL]
+#### 結合座標值與氣候值
+dt_r <- clim_dt[loc_point,on=.(LON=LON,LAT=LAT)]
+#### 將表格轉置，以方便後續資料處理
+dt_r <- melt(dt_r,id.vars=c("code","LON","LAT",
+                            "org_LON","org_LAT","set"),
+             variable.name="date")
+#### 轉換日期資料格式
+dt_r[,date:=as.Date(date,format="%Y%m%d")]
+
+```
+## Step 2.4 氣候資料篩選與組合-多表格
+成功處理單一表格後，由於各個表格的格式都相同，就可以導入lapply功能，利用平行演算的方式把所有表格的資料同步做處理。一樣先從單一點位對上多個表格。
+```{r}
+clm_factor <- "avg_T" 
+loc_point <- bs_loc[1]
+#### 使用lapply功能進行平行演算
+start_time <- Sys.time()
+clim_dt <- lapply(clim_file,function(x){
+  clim_dt <- fread(x)
+  if(colnames(clim_dt)[1]=="V1"){
+    colnames(clim_dt) <- c(colnames(clim_dt)[2:ncol(clim_dt)],
+                           "na")
+    clim_dt[,na:=NULL]
+    }
+  #### 結合座標值與氣候值
+  dt_r <- clim_dt[loc_point,on=.(LON=LON,LAT=LAT)]
+  #### 將表格轉置，以方便後續資料處理
+  dt_r <- melt(dt_r,id.vars=c("code","LON","LAT",
+                                "org_LON","org_LAT","set"),
+                 variable.name="date")
+    #### 轉換日期資料格式
+  dt_r[,date:=as.Date(date,format="%Y%m%d")]
+  return(dt_r)
+  })
+end_time <- Sys.time()
+print(end_time-start_time)
+#### 結合list資料
+dt <- rbindlist(clim_dt)
+dt[,clim_factor:=clim_factor]
+```
+## step 3. 使用真．平行演算
+使用package`parallel`，可以偵測電腦的CPU核心，並指定使用核心數量做運算。平行演算的重點是，它必須先配置好演算所需的背景變數與所需的package，因此必須寫在運算的function裡面。
+平行演算必須先用makeCluster指定計算節點數量(不要超CPU核心數量)；
+接著以clusterExport將需要運用到的環境變數分配到各節點去。
+最後跑完之後要以stopCluster()結束平行演算。
+所需的package必須包括在function內。
+```{r}
+detectCores()
+core <- makeCluster(10)
+start_time <- Sys.time()
+clusterExport(core,c("loc_point"))
+clim_dt <- parLapply(core,clim_file,function(x){
+  require(data.table)
+  pdt <- fread(x)
+  if(colnames(pdt)[1]=="V1"){
+    colnames(pdt) <- c(colnames(pdt)[2:ncol(pdt)],
+                           "na")
+    pdt[,na:=NULL]
+    }
+  #### 結合座標值與氣候值
+  dt_r <- pdt[loc_point,on=.(LON=LON,LAT=LAT)]
+  #### 將表格轉置，以方便後續資料處理
+  dt_r <- melt(dt_r,id.vars=c("code","LON","LAT",
+                                "org_LON","org_LAT","set"),
+                 variable.name="date")
+    #### 轉換日期資料格式
+  dt_r[,date:=as.Date(date,format="%Y%m%d")]
+  return(dt_r)
+  })
+stopCluster(core)
+end_time <- Sys.time()
+print(end_time-start_time)
+clim_dt <- rbindlist(clim_dt)
+```
+
+
